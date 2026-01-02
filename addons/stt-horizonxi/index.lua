@@ -46,21 +46,6 @@ local function trim(text)
     return text:gsub('^%s+', ''):gsub('%s+$', '')
 end
 
-local function handle_transcribed_text(message, chat_command)
-    if not config.enabled then
-        return false
-    end
-
-    local trimmed = trim(message)
-    if trimmed == '' then
-        return false
-    end
-
-    local command = chat_command or stt.get_chat_command_prefix()
-    AshitaCore:GetChatManager():QueueCommand(-1, string.format('%s %s', command, trimmed))
-    return true
-end
-
 local channel_modes = {
     s = { command = '/say' },
     say = { command = '/say' },
@@ -141,6 +126,151 @@ local function set_channel(mode, target)
     end
 end
 
+local function simulate_enter_press()
+    local input_manager = AshitaCore:GetInputManager()
+    if input_manager == nil then
+        return false
+    end
+
+    local keyboard = input_manager.GetKeyboard and input_manager:GetKeyboard() or nil
+    if keyboard == nil or keyboard.QueueCommand == nil then
+        return false
+    end
+
+    local ok = pcall(function()
+        keyboard:QueueCommand(1, 0x1C, true, false, false)
+        keyboard:QueueCommand(1, 0x1C, false, false, false)
+    end)
+
+    return ok
+end
+
+local function queue_chat_send(command_prefix, message)
+    local manager = AshitaCore:GetCommandManager()
+    local command = string.format('%s %s', command_prefix, message)
+
+    if manager == nil then
+        local chat_manager = AshitaCore:GetChatManager()
+        if chat_manager == nil then
+            print_status('Command manager is unavailable.')
+            return false
+        end
+
+        chat_manager:QueueCommand(-1, command)
+        simulate_enter_press()
+        return true
+    end
+
+    manager:QueueCommand(1, command)
+    simulate_enter_press()
+    return true
+end
+
+local function parse_transcription_input(raw_text, override_prefix)
+    local cleaned = trim(raw_text or '')
+    if cleaned == '' then
+        return nil, 'Empty transcription received.'
+    end
+
+    local words = {}
+    for word in cleaned:gmatch('%S+') do
+        table.insert(words, word)
+    end
+
+    if #words == 0 then
+        return nil, 'No usable words in transcription.'
+    end
+
+    if words[#words]:lower() == 'send' then
+        table.remove(words, #words)
+    end
+
+    if #words == 0 then
+        return nil, 'No chat message found after removing Send keyword.'
+    end
+
+    local potential_channel = words[1]:lower()
+    local channel_info = channel_modes[potential_channel]
+    local channel_config
+    local message_start_index = 1
+
+    if channel_info ~= nil then
+        message_start_index = 2
+        if channel_info.requires_target then
+            local target = words[2]
+            if target == nil or trim(target) == '' then
+                return nil, 'Tell channel requires a target name.'
+            end
+
+            channel_config = {
+                mode = potential_channel,
+                target = target,
+            }
+            message_start_index = 3
+        else
+            channel_config = { mode = potential_channel }
+        end
+    end
+
+    local message_text = trim(table.concat(words, ' ', message_start_index))
+    if message_text == '' then
+        return nil, 'No chat text to send.'
+    end
+
+    local command_prefix = override_prefix or build_chat_command_prefix(channel_config)
+    return {
+        command_prefix = command_prefix,
+        message = message_text,
+        channel_mode = (channel_config and channel_config.mode) or (config.channel and config.channel.mode) or default_config.channel.mode,
+    }
+end
+
+local function handle_transcribed_text(message, chat_command)
+    if not config.enabled then
+        return false
+    end
+
+    local parsed, reason = parse_transcription_input(message, chat_command)
+    if parsed == nil then
+        if reason ~= nil then
+            print_status(reason)
+        end
+        return false
+    end
+
+    local sent = queue_chat_send(parsed.command_prefix, parsed.message)
+    if sent then
+        print_status(string.format('Sent to %s: %s', parsed.channel_mode, parsed.message))
+    else
+        print_status('Failed to send transcribed chat message.')
+    end
+
+    return sent
+end
+
+local function consume_provider_event(event)
+    local text = nil
+
+    if type(event) == 'table' then
+        text = event.text or event.message or event.transcript or event.payload
+
+        if text == nil and type(event.data) == 'table' then
+            text = event.data.text or event.data.message or event.data.transcript
+        end
+    elseif type(event) == 'string' then
+        text = event
+    end
+
+    if type(text) ~= 'string' then
+        print_status('Received malformed transcription event; ignoring.')
+        return
+    end
+
+    if not handle_transcribed_text(text) then
+        print_status('Transcription could not be delivered to chat.')
+    end
+end
+
 ashita.events.register('load', 'stt_load', function()
     load_settings()
     print_status(string.format('Loaded; Speech-to-Text is currently %s.', config.enabled and 'enabled' or 'disabled'))
@@ -169,6 +299,18 @@ ashita.events.register('command', 'stt_command', function(e)
         print_status('Commands: /stt toggle | /stt channel <mode> [target]')
     end
 end)
+
+do
+    local ok, err = pcall(function()
+        ashita.events.register('stt_provider', 'stt_provider_hook', function(e)
+            consume_provider_event(e)
+        end)
+    end)
+
+    if not ok then
+        print_status(string.format('Unable to register speech-to-text provider hook: %s', err))
+    end
+end
 
 -- Expose a simple interface for other modules to respect the enabled state.
 stt = {
